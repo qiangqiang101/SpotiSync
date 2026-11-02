@@ -1,0 +1,98 @@
+name: Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number to stamp into the exe (e.g. 1.2.0). Leave empty for 0.0.0-dev."
+        required: false
+        default: ""
+
+permissions:
+  contents: write # needed to attach the build to the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Work out version
+        id: version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          # Release tag "v1.2.0" -> "1.2.0"; manual runs use the input, or a dev version.
+          $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } elseif ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "0.0.0-dev.${{ github.run_number }}" }
+          $version = $version.TrimStart('v', 'V')
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
+            throw "'$version' is not a version number like 1.2.0"
+          }
+          # Windows file versions must be four numbers: "1.2.0-beta.1" -> "1.2.0.0".
+          $fileVersion = ($version -replace '[-+].*$', '') + '.0'
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "fileVersion=$fileVersion" >> $env:GITHUB_OUTPUT
+          "zip=SpotiSync-$version-win-x64.zip" >> $env:GITHUB_OUTPUT
+          "setup=SpotiSync-$version-setup.exe" >> $env:GITHUB_OUTPUT
+
+      - name: Publish
+        run: >
+          dotnet publish SpotiSync/SpotiSync.vbproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=none
+          -p:Version=${{ steps.version.outputs.version }}
+          --output publish
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/* -DestinationPath "${{ steps.version.outputs.zip }}"
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup*\ISCC.exe", "$env:ProgramFiles\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe (Inno Setup compiler) not found" }
+          & $iscc.FullName `
+            "/DAppVersion=${{ steps.version.outputs.version }}" `
+            "/DFileVersion=${{ steps.version.outputs.fileVersion }}" `
+            "/DAppUrl=${{ github.server_url }}/${{ github.repository }}" `
+            installer/SpotiSync.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+          Move-Item "installer-output/${{ steps.version.outputs.setup }}" .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpotiSync-${{ steps.version.outputs.version }}-win-x64
+          path: |
+            ${{ steps.version.outputs.zip }}
+            ${{ steps.version.outputs.setup }}
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release upload "${{ github.event.release.tag_name }}"
+          "${{ steps.version.outputs.zip }}"
+          "${{ steps.version.outputs.setup }}"
+          --clobber

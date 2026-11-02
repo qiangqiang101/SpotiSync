@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SpotiSync</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="theme-color" content="#121212">
+<style>
+  :root { --bg: #121212; --panel: #1e1e1e; --text: #fff; --muted: #a7a7a7; --accent: #1ed760; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: var(--bg); color: var(--text); font-family: "Segoe UI", system-ui, sans-serif; }
+  .player { width: min(420px, 94vw); background: var(--panel); border-radius: 16px; padding: 24px; }
+  .cover { width: 100%; aspect-ratio: 1; border-radius: 10px; background: #2a2a2a center / cover no-repeat;
+           display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 64px; }
+  .title { margin: 18px 0 2px; font-size: 1.35rem; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .artist { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .seek { margin-top: 16px; }
+  .times { display: flex; justify-content: space-between; color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .controls { display: flex; justify-content: center; align-items: center; gap: 14px; margin: 10px 0 18px; }
+  button { background: none; border: 0; color: var(--text); cursor: pointer; font-size: 1.5rem; padding: 8px; border-radius: 50%; }
+  button:hover:not(:disabled) { color: var(--accent); }
+  button:disabled { opacity: .35; cursor: default; }
+  #play { background: var(--text); color: #000; width: 60px; height: 60px; font-size: 1.6rem; }
+  #play:hover:not(:disabled) { color: #000; transform: scale(1.05); }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--muted); font-size: .85rem; }
+  .row label { width: 92px; flex: none; }
+  .row input[type=text] { flex: 1; background: #2a2a2a; border: 1px solid #333; color: var(--text); padding: 6px 8px; border-radius: 6px; }
+  #listen { width: 100%; margin-top: 18px; padding: 12px; border-radius: 999px; font-size: 1rem; font-weight: 700;
+            background: var(--accent); color: #000; }
+  #listen.on { background: #2a2a2a; color: var(--text); }
+  .status { margin-top: 12px; text-align: center; color: var(--muted); font-size: .8rem; min-height: 1.2em; }
+  .status.warn { color: #f5a623; }
+</style>
+</head>
+<body>
+<div class="player">
+  <div class="cover" id="cover">♪</div>
+  <div class="title" id="title">Not playing</div>
+  <div class="artist" id="artist">&nbsp;</div>
+
+  <div class="seek">
+    <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+    <div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div>
+  </div>
+
+  <div class="controls">
+    <button id="prev" title="Previous">⏮</button>
+    <button id="stop" title="Stop">⏹</button>
+    <button id="play" title="Play/Pause">▶</button>
+    <button id="next" title="Next">⏭</button>
+  </div>
+
+  <div class="row"><label for="volume">All rooms</label><input type="range" id="volume" min="0" max="100" value="50"></div>
+  <div class="row"><label for="roomVolume">This room</label><input type="range" id="roomVolume" min="0" max="100" value="100"></div>
+  <div class="row"><label for="room">Room name</label><input type="text" id="room" placeholder="e.g. Bedroom" maxlength="40"></div>
+
+  <button id="listen">🔊 Listen in this room</button>
+  <div class="status" id="status">Connecting…</div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+// ---- Connection & clock sync -------------------------------------------------------------------
+// The host stamps every audio chunk with its own clock. Each browser estimates the host clock
+// (NTP-style ping/pong, keeping the lowest-latency samples) and plays each chunk at
+// host time + latencyMs, so every room hears the same sample at the same moment.
+let ws = null;
+let config = { latencyMs: 800, sampleRate: 48000, channels: 2 };
+let clockSamples = [];
+let clockOffset = null;            // host clock - performance.now(), in ms
+let state = null;
+let stateReceivedAt = 0;
+
+function hostNow() { return performance.now() + clockOffset; }
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    clockSamples = [];
+    clockOffset = null;
+    sendHello();
+    for (let i = 0; i < 8; i++) setTimeout(ping, i * 150);
+  };
+  ws.onclose = () => { setStatus("Disconnected from SpotiSync, reconnecting…", true); resetPlayback(); setTimeout(connect, 2000); };
+  ws.onmessage = e => typeof e.data === "string" ? onText(JSON.parse(e.data)) : onAudio(e.data);
+}
+
+function send(msg) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
+function ping() { send({ type: "ping", c: performance.now() }); }
+function sendHello() { send({ type: "hello", name: $("room").value.trim(), listening: !!audio }); }
+setInterval(ping, 2000);
+
+function onText(msg) {
+  switch (msg.type) {
+    case "pong": {
+      const now = performance.now();
+      const rtt = now - msg.c;
+      clockSamples.push({ rtt, offset: msg.s + rtt / 2 - now });
+      if (clockSamples.length > 30) clockSamples.shift();
+      clockOffset = clockSamples.reduce((a, b) => (b.rtt < a.rtt ? b : a)).offset;
+      break;
+    }
+    case "config":
+      config = msg;
+      resetPlayback();
+      break;
+    case "state":
+      state = msg;
+      stateReceivedAt = performance.now();
+      renderState();
+      break;
+  }
+}
+
+// ---- Audio playback ------------------------------------------------------------------------------
+let audio = null;                  // { ctx, gain }
+let nextFrame = 0;                 // AudioContext sample frame at which the next chunk continues (0 = not playing)
+let ctxMap = null;                 // smoothed (contextTime*1000 - performanceTime) for output timing
+let errors = [];                   // recent raw scheduling errors in seconds (> 0: this room is behind)
+let syncError = 0;                 // median of `errors`: the timing error with measurement noise removed
+let correctionRate = 0;            // samples to drop (+) or insert (-) per chunk, from syncError
+let correctionDebt = 0;            // accumulated fraction of a sample still to correct
+let chunkCount = 0, settled = false;
+let resyncs = 0, lateChunks = 0, corrections = 0;
+
+// This computer's audio clock drifts against the host's (from ~0.001% up to ~0.1%), and each timing
+// measurement is noisy by a few ms. So: judge the error by its median over ~2 s, and remove it gradually
+// over ~4 s by dropping or inserting single samples at the quietest point of a chunk (inaudible).
+const ERROR_WINDOW = 100;          // chunks (2 s)
+const EVALUATE_EVERY = 25;         // chunks (0.5 s)
+const CORRECT_OVER = 4;            // seconds to work off an error
+const DEAD_ZONE = 0.0005, JUMP = 0.1;   // seconds
+
+function resetPlayback() {
+  nextFrame = 0; errors = []; syncError = 0; correctionRate = 0; correctionDebt = 0; chunkCount = 0; settled = false;
+}
+
+function median(values) { const s = [...values].sort((a, b) => a - b); return s[s.length >> 1]; }
+
+async function startListening() {
+  let ctx;
+  try { ctx = new AudioContext({ sampleRate: config.sampleRate, latencyHint: "playback" }); }
+  catch { ctx = new AudioContext({ latencyHint: "playback" }); }
+  await ctx.resume();
+  const gain = ctx.createGain();
+  gain.gain.value = roomVolume();
+  gain.connect(ctx.destination);
+  audio = { ctx, gain };
+  ctxMap = null;
+  resetPlayback();
+  sendHello();
+  renderListen();
+}
+
+function stopListening() {
+  if (audio) audio.ctx.close();
+  audio = null;
+  sendHello();
+  renderListen();
+}
+
+// Converts a performance.now() time into the AudioContext time whose sample is heard at that moment.
+function ctxTimeFor(perfMs) {
+  const ctx = audio.ctx;
+  let m;
+  const ts = ctx.getOutputTimestamp ? ctx.getOutputTimestamp() : null;
+  if (ts && ts.performanceTime > 0) m = ts.contextTime * 1000 - ts.performanceTime;
+  else m = ctx.currentTime * 1000 - performance.now() - (ctx.outputLatency || ctx.baseLatency || 0) * 1000;
+  ctxMap = ctxMap === null ? m : ctxMap + (m - ctxMap) * 0.02;
+  return (perfMs + ctxMap) / 1000;
+}
+
+function onAudio(buffer) {
+  if (!audio || clockOffset === null || audio.ctx.state !== "running") return;
+  const ctx = audio.ctx;
+  const channels = config.channels;
+  const hostMs = new DataView(buffer).getFloat64(0, true);
+  const pcm = new Int16Array(buffer, 8);
+  const frames = pcm.length / channels;
+  const rate = ctx.sampleRate;
+  const idealFrame = Math.round(ctxTimeFor(hostMs + config.latencyMs - clockOffset) * rate);
+
+  // Chunks are played back-to-back at normal speed on an exact sample grid, so the joins are seamless.
+  if (!nextFrame) {
+    resetPlayback();
+    nextFrame = idealFrame;        // first chunk, or after a pause
+  } else {
+    const error = (nextFrame - idealFrame) / rate;
+    if (Math.abs(error) > JUMP) {  // far off (e.g. audio gap on the host): jump to the right time
+      resetPlayback();
+      nextFrame = idealFrame;
+      resyncs++;
+    } else {
+      errors.push(error);
+      if (errors.length > ERROR_WINDOW) errors.shift();
+      if (++chunkCount % EVALUATE_EVERY === 0 && errors.length >= ERROR_WINDOW) {
+        syncError = median(errors);
+        if (!settled) {
+          // ~2 s in, the estimate is reliable: line up precisely once instead of creeping there slowly.
+          settled = true;
+          if (Math.abs(syncError) > DEAD_ZONE) { nextFrame -= Math.round(syncError * rate); errors = []; syncError = 0; }
+        } else {
+          const perChunk = syncError * config.sampleRate / (CORRECT_OVER * config.sampleRate / frames);
+          correctionRate = Math.abs(syncError) < DEAD_ZONE ? 0 : Math.max(-1, Math.min(1, perChunk));
+        }
+      }
+    }
+  }
+  if (nextFrame / rate < ctx.currentTime + 0.01) { lateChunks++; nextFrame = 0; return; }   // too late to play
+
+  // Drift correction: when a whole sample is due, drop (+1) or repeat (-1) one sample at the point in
+  // this chunk where the waveform changes least, so the edit can't be heard.
+  correctionDebt += correctionRate;
+  const adjust = correctionDebt >= 1 ? 1 : correctionDebt <= -1 ? -1 : 0;
+  correctionDebt -= adjust;
+  let at = -1;
+  if (adjust) {
+    corrections++;
+    let best = Infinity;
+    for (let i = 1; i < frames - 1; i++) {
+      let change = 0;
+      for (let ch = 0; ch < channels; ch++) change += Math.abs(pcm[(i + 1) * channels + ch] - pcm[i * channels + ch]);
+      if (change < best) { best = change; at = i; }
+    }
+  }
+  const outFrames = frames - adjust;
+  const chunk = ctx.createBuffer(channels, outFrames, config.sampleRate);
+  for (let ch = 0; ch < channels; ch++) {
+    const out = chunk.getChannelData(ch);
+    for (let i = 0, j = 0; i < outFrames; i++, j++) {
+      if (adjust === 1 && j === at) j++;           // skip one sample
+      out[i] = pcm[j * channels + ch] / 32768;
+      if (adjust === -1 && j === at && i + 1 < outFrames) out[++i] = out[i - 1];   // repeat one sample
+    }
+  }
+
+  const source = ctx.createBufferSource();
+  source.buffer = chunk;
+  source.connect(audio.gain);
+  source.start(nextFrame / rate);
+  nextFrame += outFrames * rate / config.sampleRate;
+}
+
+// ---- UI ----------------------------------------------------------------------------------------
+const fmt = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+let seeking = false;
+
+function heardPositionMs() {
+  if (!state) return 0;
+  // Soloist's position, advanced to now, minus the playback delay: what the rooms are hearing.
+  const elapsed = clockOffset === null ? performance.now() - stateReceivedAt : hostNow() - state.positionAt;
+  const pos = state.positionMs + (elapsed - config.latencyMs) * state.speed;
+  return Math.max(0, Math.min(pos, state.durationMs || pos));
+}
+
+function renderState() {
+  const s = state;
+  const ready = s.connected && s.loggedIn;
+  $("title").textContent = s.title || (ready ? "Nothing playing" : "Not playing");
+  $("artist").textContent = s.artist || " ";
+  const cover = $("cover");
+  cover.style.backgroundImage = s.cover ? `url("${s.cover}")` : "";
+  cover.textContent = s.cover ? "" : "♪";
+  $("play").textContent = s.status === "playing" || s.status === "buffering" ? "⏸" : "▶";
+  for (const id of ["prev", "stop", "play", "next", "seek", "volume"]) $(id).disabled = !ready;
+  if (document.activeElement !== $("volume")) $("volume").value = s.volume;
+  document.title = s.title ? `${s.title} · SpotiSync` : "SpotiSync";
+  if (!s.connected) setStatus("SpotiSync host: Soloist is not running.", true);
+  else if (!s.loggedIn) setStatus(`Open Spotify and select the device “${s.deviceName || "SpotiSync"}” to start.`, true);
+  else updateStatusLine();
+}
+
+function updateStatusLine() {
+  if (!state || !state.connected || !state.loggedIn) return;
+  if (!audio) setStatus("Controls only. Tap “Listen” to play audio in this room.");
+  else if (clockOffset === null) setStatus("Synchronising clock…");
+  else {
+    const rateNote = audio.ctx.sampleRate !== config.sampleRate ? ` · resampling to ${audio.ctx.sampleRate} Hz` : "";
+    const problems = resyncs + lateChunks ? ` · ${lateChunks} late, ${resyncs} jumps` : "";
+    setStatus(`In sync · ${config.latencyMs} ms buffer · off by ${(syncError * 1000).toFixed(1)} ms${problems}${rateNote}`, lateChunks > 0);
+  }
+}
+
+function setStatus(text, warn) { const el = $("status"); el.textContent = text; el.classList.toggle("warn", !!warn); }
+
+function renderListen() {
+  const b = $("listen");
+  b.classList.toggle("on", !!audio);
+  b.textContent = audio ? "🔇 Stop listening in this room" : "🔊 Listen in this room";
+  updateStatusLine();
+}
+
+function tick() {
+  if (state) {
+    const pos = heardPositionMs();
+    $("pos").textContent = fmt(seeking ? $("seek").value / 1000 * state.durationMs : pos);
+    $("dur").textContent = fmt(state.durationMs);
+    if (!seeking) $("seek").value = state.durationMs ? Math.round(pos / state.durationMs * 1000) : 0;
+  }
+  requestAnimationFrame(tick);
+}
+
+const command = (action, extra) => send({ type: "command", action, ...extra });
+$("prev").onclick = () => command("prev");
+$("next").onclick = () => command("next");
+$("stop").onclick = () => command("stop");
+$("play").onclick = () => command("toggle");
+$("seek").oninput = () => { seeking = true; };
+$("seek").onchange = () => {
+  seeking = false;
+  if (state && state.durationMs) command("seek", { positionMs: Math.round($("seek").value / 1000 * state.durationMs) });
+};
+$("volume").onchange = () => command("volume", { volume: Number($("volume").value) });
+
+function roomVolume() { const v = Number($("roomVolume").value) / 100; return v * v; }
+$("roomVolume").value = localStorage.getItem("spotisync.roomVolume") ?? 100;
+$("roomVolume").oninput = () => {
+  localStorage.setItem("spotisync.roomVolume", $("roomVolume").value);
+  if (audio) audio.gain.gain.setTargetAtTime(roomVolume(), audio.ctx.currentTime, 0.05);
+};
+
+$("room").value = localStorage.getItem("spotisync.room") ?? "";
+$("room").onchange = () => { localStorage.setItem("spotisync.room", $("room").value.trim()); sendHello(); };
+
+$("listen").onclick = () => (audio ? stopListening() : startListening());
+setInterval(updateStatusLine, 1000);
+
+connect();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
